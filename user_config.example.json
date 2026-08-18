@@ -1,0 +1,12 @@
+{
+  "last_path": "",
+  "recursive": true,
+  "include_hidden": false,
+  "skip_system": true,
+  "scan_all_drives": false,
+  "include_removable": false,
+  "encrypt_path": "",
+  "encrypt_recursive": true,
+  "encrypt_include_hidden": true,
+  "encrypt_stop_on_error": false
+}
