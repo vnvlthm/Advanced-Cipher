@@ -299,18 +299,22 @@ def _is_drive_root(path: str) -> bool:
 
 
 def open_in_explorer(path: str) -> None:
-    """Reveal `path` in Explorer (`/select` highlights the item)."""
-    target = Path(path)
+    """Reveal `path` in Explorer. Folders open in place; files are selected."""
+    if not path or not str(path).strip():
+        raise ValueError("No path to open.")
+    target = Path(str(path).strip())
     if not target.exists():
         parent = target.parent
         if parent.exists():
-            subprocess.Popen(["explorer", str(parent)])
-        else:
-            raise FileNotFoundError(path)
+            os.startfile(str(parent))  # type: ignore[attr-defined]
+            return
+        raise FileNotFoundError(str(target))
+    # /n forces a new window so Explorer does not just focus the last folder.
+    # Do not pass CREATE_NO_WINDOW or the window may never appear.
+    if target.is_dir():
+        os.startfile(str(target))  # type: ignore[attr-defined]
         return
-    # /select,PATH — no space after the comma. Explorer is a GUI process;
-    # do not pass CREATE_NO_WINDOW or the window may never appear.
-    subprocess.Popen(["explorer", f"/select,{target}"])
+    subprocess.Popen(["explorer", "/n", "/select," + str(target)])
 
 
 def open_folder(path: str) -> None:
@@ -848,6 +852,68 @@ def item_to_row(item: EncryptedItem) -> dict:
         "modified": item.modified,
         "modified_ts": item.modified_ts,
     }
+
+
+def containing_folder_rows(rows: Iterable[dict]) -> list[dict]:
+    """
+    Unique parent folders of encrypted *files* in `rows`.
+
+    A folder appears even if it is not marked Encrypted itself — that is the
+    usual gap: you can only reach it from a file row. Size is the sum of those
+    files. file_count is how many encrypted files sit directly in the folder.
+    """
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        if (row.get("kind") or "") != "File":
+            continue
+        path = str(row.get("path") or "")
+        if not path:
+            continue
+        parent = str(row.get("parent") or Path(path).parent)
+        if not parent:
+            continue
+        abs_parent = os.path.abspath(parent)
+        key = os.path.normcase(abs_parent)
+        bucket = buckets.get(key)
+        if bucket is None:
+            name = Path(abs_parent).name or abs_parent
+            buckets[key] = {
+                "kind": "Folder",
+                "kind_rank": 0,
+                "name": name,
+                "path": abs_parent,
+                "parent": str(Path(abs_parent).parent),
+                "size": 0,
+                "size_label": "—",
+                "modified": "—",
+                "modified_ts": 0.0,
+                "file_count": 0,
+                "encrypted_folder": is_encrypted_path(abs_parent),
+                "role": "container",
+            }
+            bucket = buckets[key]
+        bucket["file_count"] = int(bucket["file_count"]) + 1
+        try:
+            bucket["size"] = int(bucket["size"]) + int(row.get("size") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            mts = float(row.get("modified_ts") or 0)
+        except (TypeError, ValueError):
+            mts = 0.0
+        if mts >= float(bucket.get("modified_ts") or 0):
+            bucket["modified_ts"] = mts
+            if row.get("modified"):
+                bucket["modified"] = row["modified"]
+    result: list[dict] = []
+    for bucket in buckets.values():
+        n = int(bucket["file_count"])
+        files = "1 file" if n == 1 else f"{n:,} files"
+        size = format_size(int(bucket["size"])) if bucket["size"] else "—"
+        bucket["size_label"] = f"{files} · {size}"
+        result.append(bucket)
+    result.sort(key=lambda row: str(row.get("path") or "").casefold())
+    return result
 
 
 def scan_encrypted(

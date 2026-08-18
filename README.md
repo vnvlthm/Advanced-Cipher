@@ -13,7 +13,7 @@ shows). Details still come from `cipher /c` and `cipher /y`.
 
 | Tab | What it does |
 |---|---|
-| **Find encrypted** | Scan a folder or every local NTFS drive. List encrypted files and folders. Reveal in Explorer, copy the path, show `cipher /c`, or decrypt with `cipher /D`. Sort **Folders first**. |
+| **Find encrypted** | Scan a folder or every local NTFS drive. List encrypted files and folders. Switch to **Folders with files** to list every parent folder that contains encrypted files (even if the folder itself is not marked encrypted), then decrypt that folder with `cipher /D /S`. Reveal in Explorer, copy the path, show `cipher /c`, or decrypt a selection. Sort **Folders first**. |
 | **Encrypt** | Add folders, preview `cipher /E` (`/S` tree, `/H` hidden, `/B` stop on error), confirm, and encrypt as the current Windows user. |
 | **Cipher manual** | What EFS is, quick start, safety, how it differs from BitLocker. |
 | **Command map** | Every `cipher` switch with syntax, examples, and whether this app wraps it. |
@@ -52,7 +52,8 @@ saved locally to `user_config.json`, which is gitignored.
 5. Double-click a row, or use **Reveal in Explorer**, to open that position in Explorer.
 6. **cipher /c details** shows who can decrypt the file.
 7. Check rows and click **Decrypt** to run `cipher /D` after a confirmation. Folders default to `/D /S`.
-8. Use **Folders first** (or the Type column) to group folders above files.
+8. Use **Folders with files** to list unique parent folders of those files, then decrypt a folder in one step.
+9. Use **Folders first** (or the Type column) to group folders above files.
 
 ## Usage — Encrypt
 

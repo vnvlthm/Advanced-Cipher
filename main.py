@@ -37,6 +37,7 @@ class AppConfig:
     encrypt_recursive: bool = True
     encrypt_include_hidden: bool = True
     encrypt_stop_on_error: bool = False
+    scan_view: str = "items"
 
 
 def load_config() -> AppConfig:
@@ -74,7 +75,27 @@ def _row_from_event(e: Any) -> dict:
     return args if isinstance(args, dict) else {}
 
 
+def _path_from_event(e: Any) -> str:
+    """Pull a filesystem path out of a table slot / row-dblclick event."""
+    args = getattr(e, "args", e)
+    chunks = args if isinstance(args, list) else [args]
+    for item in chunks:
+        if isinstance(item, str):
+            text = item.strip()
+            if len(text) >= 2 and (text[1] == ":" or text.startswith("\\\\")):
+                return text
+        elif isinstance(item, dict):
+            text = str(item.get("path") or "").strip()
+            if text:
+                return text
+    return ""
+
+
 def _safe_open_explorer(path: str) -> None:
+    path = (path or "").strip()
+    if not path:
+        ui.notify("Could not read that row’s path.", type="warning")
+        return
     try:
         cipher_ops.open_in_explorer(path)
         ui.notify(f"Opened in Explorer:\n{path}", type="positive")
@@ -83,6 +104,10 @@ def _safe_open_explorer(path: str) -> None:
 
 
 def _copy_path(path: str) -> None:
+    path = (path or "").strip()
+    if not path:
+        ui.notify("Could not read that row’s path.", type="warning")
+        return
     ui.clipboard.write(path)
     ui.notify("Path copied", type="positive")
 
@@ -813,9 +838,11 @@ def build_scanner_tab() -> None:
             ui.markdown(
                 "**Find EFS-encrypted files and folders** on this PC, then open "
                 "their location in Explorer or decrypt a selection with `cipher /D`. "
-                "Detection uses the NTFS *Encrypted* attribute (the same padlock "
-                "Explorer shows) — it does not parse the localized `cipher` text. "
-                "Details still come from `cipher /c`."
+                "Use **Folders with files** to list every folder that *contains* "
+                "encrypted files (even if the folder itself is not marked encrypted), "
+                "then decrypt that folder. Detection uses the NTFS *Encrypted* "
+                "attribute (the same padlock Explorer shows) — it does not parse "
+                "the localized `cipher` text. Details still come from `cipher /c`."
             )
             cert_label = ui.label("Reading EFS certificate…").classes(
                 "text-caption text-grey-8 mt-2"
@@ -938,6 +965,21 @@ def build_scanner_tab() -> None:
                         .tooltip("Show the action bar for the checked items")
                     )
                     selection_chip.visible = False
+                    w_view = ui.toggle(
+                        {
+                            "items": "All items",
+                            "containers": "Folders with files",
+                        },
+                        value=(
+                            cfg.scan_view
+                            if cfg.scan_view in {"items", "containers"}
+                            else "items"
+                        ),
+                    ).props("no-caps unelevated").tooltip(
+                        "All items: every encrypted file and folder. "
+                        "Folders with files: unique parent folders of those "
+                        "files, so you can decrypt a whole folder at once."
+                    )
                     ui.button(
                         "Folders first",
                         icon="folder",
@@ -982,6 +1024,11 @@ def build_scanner_tab() -> None:
                 """
                 <q-td :props="props">
                     <div class="ellipsis">{{ props.row.name }}</div>
+                    <div v-if="props.row.file_count" class="text-caption text-grey-7">
+                        {{ props.row.file_count }} encrypted
+                        {{ props.row.file_count === 1 ? 'file' : 'files' }}
+                        <span v-if="props.row.encrypted_folder"> · folder marked encrypted</span>
+                    </div>
                     <q-tooltip class="text-body2" max-width="36rem">
                         {{ props.row.name }}
                     </q-tooltip>
@@ -1004,15 +1051,15 @@ def build_scanner_tab() -> None:
                 """
                 <q-td :props="props" style="width: 8rem; white-space: nowrap;">
                     <q-btn flat dense round icon="folder_open" color="primary"
-                           @click.stop="$parent.$emit('open_explorer', props.row)">
+                           @click.stop="$parent.$emit('open_explorer', props.row.path)">
                         <q-tooltip>Reveal in Explorer</q-tooltip>
                     </q-btn>
                     <q-btn flat dense round icon="info" color="secondary"
-                           @click.stop="$parent.$emit('show_info', props.row)">
+                           @click.stop="$parent.$emit('show_info', props.row.path)">
                         <q-tooltip>cipher /c details</q-tooltip>
                     </q-btn>
                     <q-btn flat dense round icon="content_copy"
-                           @click.stop="$parent.$emit('copy_path', props.row)">
+                           @click.stop="$parent.$emit('copy_path', props.row.path)">
                         <q-tooltip>Copy path</q-tooltip>
                     </q-btn>
                 </q-td>
@@ -1047,7 +1094,8 @@ def build_scanner_tab() -> None:
                     icon="lock_open",
                     on_click=lambda: act_selected("decrypt"),
                 ).props("outline color=negative").tooltip(
-                    "Remove EFS encryption with cipher /D"
+                    "Remove EFS encryption with cipher /D. "
+                    "In Folders with files, this decrypts the folder tree (/D /S)."
                 )
                 ui.button(
                     "Clear results",
@@ -1066,6 +1114,11 @@ def build_scanner_tab() -> None:
                 table.pagination = {**pag, "sortBy": "kind", "descending": False}
             ui.notify("Folders first, then files.", type="positive")
 
+        scan_items: list[dict] = []
+        view_state = {
+            "mode": cfg.scan_view if cfg.scan_view in {"items", "containers"} else "items"
+        }
+
         def persist_settings(*, notify: bool = True) -> None:
             cfg.last_path = (w_path.value or "").strip()
             cfg.recursive = bool(w_recursive.value)
@@ -1073,9 +1126,69 @@ def build_scanner_tab() -> None:
             cfg.skip_system = bool(w_skip.value)
             cfg.scan_all_drives = bool(w_all.value)
             cfg.include_removable = bool(w_removable.value)
+            cfg.scan_view = view_state["mode"]
             save_config(cfg)
             if notify:
                 ui.notify("Settings saved", type="positive")
+
+        def displayed_rows() -> list[dict]:
+            if view_state["mode"] == "containers":
+                return cipher_ops.containing_folder_rows(scan_items)
+            return list(scan_items)
+
+        def update_summary(shown: list[dict]) -> None:
+            n_files = sum(1 for row in scan_items if row.get("kind") == "File")
+            n_dirs = sum(1 for row in scan_items if row.get("kind") == "Folder")
+            if view_state["mode"] == "containers":
+                marked = sum(1 for row in shown if row.get("encrypted_folder"))
+                extra = f" · {marked:,} also marked encrypted" if marked else ""
+                summary.set_text(
+                    f"{len(shown):,} folder(s) with encrypted files — "
+                    f"{n_files:,} file(s){extra}."
+                )
+            else:
+                summary.set_text(
+                    f"{len(scan_items):,} encrypted item(s) — "
+                    f"{n_files:,} file(s), {n_dirs:,} folder(s)."
+                )
+
+        def render_view(*, clear_selection: bool = False) -> None:
+            shown = displayed_rows()
+            if view_state["mode"] != "containers":
+                shown = _sort_rows_folders_first(shown)
+            selected_paths = set()
+            if not clear_selection:
+                selected_paths = {
+                    str(row.get("path")) for row in selected_rows() if row.get("path")
+                }
+            table.rows = shown
+            table.selected = [
+                row for row in shown if str(row.get("path")) in selected_paths
+            ]
+            update_summary(shown)
+            refresh_selection_ui()
+
+        def set_view() -> None:
+            mode = w_view.value if w_view.value in {"items", "containers"} else "items"
+            if mode == view_state["mode"] and table.rows:
+                return
+            view_state["mode"] = mode
+            persist_settings(notify=False)
+            if not scan_items:
+                table.rows = []
+                table.selected = []
+                if mode == "containers":
+                    summary.set_text("No scan yet. Folders with files will list parent folders.")
+                else:
+                    summary.set_text("No scan yet.")
+                refresh_selection_ui()
+                return
+            render_view(clear_selection=True)
+            if mode == "containers":
+                ui.notify(
+                    f"{len(table.rows or []):,} folder(s) contain encrypted files.",
+                    type="info",
+                )
 
         def selected_rows() -> list[dict]:
             return list(table.selected or [])
@@ -1090,24 +1203,13 @@ def build_scanner_tab() -> None:
             return paths
 
         def drop_unencrypted_rows() -> None:
-            selected = {
-                str(row.get("path")) for row in selected_rows() if row.get("path")
-            }
             kept = []
-            for row in list(table.rows or []):
+            for row in list(scan_items):
                 path = str(row.get("path") or "")
                 if path and cipher_ops.is_encrypted_path(path):
                     kept.append(row)
-            table.rows = kept
-            table.selected = [
-                row for row in kept if str(row.get("path")) in selected
-            ]
-            n_files = sum(1 for row in kept if row.get("kind") == "File")
-            n_dirs = sum(1 for row in kept if row.get("kind") == "Folder")
-            summary.set_text(
-                f"{len(kept):,} encrypted item(s) — {n_files:,} file(s), {n_dirs:,} folder(s)."
-            )
-            refresh_selection_ui()
+            scan_items[:] = kept
+            render_view(clear_selection=False)
 
         def confirm_decrypt() -> None:
             rows = selected_rows()
@@ -1196,6 +1298,7 @@ def build_scanner_tab() -> None:
             refresh_selection_ui()
 
         def clear_results() -> None:
+            scan_items.clear()
             table.rows = []
             table.selected = []
             selection_ui["dock_hidden"] = False
@@ -1262,15 +1365,9 @@ def build_scanner_tab() -> None:
         selection_dock.visible = False
 
         def apply_rows(rows: list[dict]) -> None:
-            table.rows = _sort_rows_folders_first(rows)
-            table.selected = []
+            scan_items[:] = list(rows)
             selection_ui["dock_hidden"] = False
-            refresh_selection_ui()
-            n_files = sum(1 for r in rows if r.get("kind") == "File")
-            n_dirs = sum(1 for r in rows if r.get("kind") == "Folder")
-            summary.set_text(
-                f"{len(rows):,} encrypted item(s) — {n_files:,} file(s), {n_dirs:,} folder(s)."
-            )
+            render_view(clear_selection=True)
 
         def refresh_live() -> None:
             if status.is_deleted:
@@ -1284,8 +1381,16 @@ def build_scanner_tab() -> None:
                 errors = job.errors
                 current = job.current
                 rows = list(job.rows)
-            table.rows = rows
-            summary.set_text(f"{found:,} encrypted item(s) so far…")
+            scan_items[:] = rows
+            if view_state["mode"] == "containers":
+                shown = cipher_ops.containing_folder_rows(rows)
+                table.rows = shown
+                summary.set_text(
+                    f"{len(shown):,} folder(s) with encrypted files so far…"
+                )
+            else:
+                table.rows = rows
+                summary.set_text(f"{found:,} encrypted item(s) so far…")
             loc = current if len(current) < 90 else "…" + current[-87:]
             extra = f" · {errors} access error(s)" if errors else ""
             status.set_text(f"Scanned {scanned:,} · found {found:,}{extra} · {loc}")
@@ -1324,6 +1429,7 @@ def build_scanner_tab() -> None:
 
             job = cipher_ops.ScanProgress(running=True)
             scan_job = job
+            scan_items.clear()
             table.rows = []
             table.selected = []
             selection_ui["dock_hidden"] = False
@@ -1377,11 +1483,16 @@ def build_scanner_tab() -> None:
 
         scan_btn.on_click(start_scan)
         w_path.on("keydown.enter", start_scan)
+        w_view.on_value_change(lambda _e: set_view())
 
-        table.on("open_explorer", lambda e: _safe_open_explorer(_row_from_event(e).get("path", "")))
-        table.on("copy_path", lambda e: _copy_path(_row_from_event(e).get("path", "")))
-        table.on("show_info", lambda e: show_info_dialog(_row_from_event(e).get("path", "")))
-        table.on("rowDblclick", lambda e: _safe_open_explorer(_row_from_event(e).get("path", "")))
+        table.on("open_explorer", lambda e: _safe_open_explorer(_path_from_event(e)))
+        table.on("copy_path", lambda e: _copy_path(_path_from_event(e)))
+        table.on("show_info", lambda e: show_info_dialog(_path_from_event(e)))
+        table.on(
+            "rowDblclick",
+            lambda e: _safe_open_explorer(_path_from_event(e)),
+            js_handler="(_evt, row) => emit(row && row.path)",
+        )
 
 
 def show_info_dialog(path: str | list[str]) -> None:

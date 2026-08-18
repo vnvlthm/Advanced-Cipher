@@ -8,5 +8,6 @@
   "encrypt_path": "",
   "encrypt_recursive": true,
   "encrypt_include_hidden": true,
-  "encrypt_stop_on_error": false
+  "encrypt_stop_on_error": false,
+  "scan_view": "items"
 }
