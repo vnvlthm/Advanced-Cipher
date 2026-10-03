@@ -10,6 +10,7 @@ with `cipher /E` from the Encrypt tab. Wipe stays reserved for a later tab.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -231,6 +232,41 @@ def _open_many_parents(paths: list[str]) -> None:
         ui.notify(f"Opened {opened} folder(s); {errors} failed{extra}.", type="warning")
 
 
+def _format_decrypt_log(
+    results: list[cipher_ops.DecryptResult],
+    *,
+    ok_cap: int = 8,
+    fail_cap: int = 40,
+) -> str:
+    failed = [item for item in results if not item.ok]
+    ok_items = [item for item in results if item.ok]
+    chunks: list[str] = []
+    for item in failed[:fail_cap]:
+        block = f"[FAILED] {item.command}"
+        if item.text:
+            block += "\n" + item.text
+        if item.still_encrypted:
+            block += "\n(Still has the Encrypted NTFS attribute.)"
+        chunks.append(block)
+    extra_fail = len(failed) - fail_cap
+    if extra_fail > 0:
+        chunks.append(f"…{extra_fail:,} more failed command(s)")
+    shown_ok = 0
+    for item in ok_items:
+        if shown_ok >= ok_cap:
+            break
+        block = f"[OK] {item.command}"
+        if item.text:
+            text = item.text if len(item.text) <= 400 else item.text[:400] + "…"
+            block += "\n" + text
+        chunks.append(block)
+        shown_ok += 1
+    leftover_ok = len(ok_items) - shown_ok
+    if leftover_ok > 0:
+        chunks.append(f"…{leftover_ok:,} more command(s) succeeded")
+    return "\n\n".join(chunks) or "(no cipher output)"
+
+
 def show_decrypt_dialog(
     rows: list[dict],
     *,
@@ -282,6 +318,15 @@ def show_decrypt_dialog(
             if extra > 0:
                 ui.label(f"+{extra:,} more").classes("text-caption text-grey-7")
 
+            large_job = len(rows) > cipher_ops.DECRYPT_BATCH_FILES or n_folders > 0
+            if large_job:
+                ui.label(
+                    "Large jobs run in batches of up to "
+                    f"{cipher_ops.DECRYPT_BATCH_FILES} items. A progress bar "
+                    "moves as files finish. Pause waits for the current batch; "
+                    "Stop ends cipher and leaves the rest encrypted."
+                ).classes("text-caption text-grey-8")
+
             w_recursive = ui.checkbox(
                 "Also decrypt everything inside selected folders (cipher /D /S)",
                 value=True,
@@ -317,6 +362,11 @@ def show_decrypt_dialog(
                         ui.label(f"+{leftover:,} more cipher command(s)").classes(
                             "text-caption text-grey-7"
                         )
+                    if any(item.recursive for item in plan):
+                        ui.label(
+                            "Folder trees are listed first, then decrypted in "
+                            "batches so the bar can move and you can pause or stop."
+                        ).classes("text-caption text-grey-7")
 
             w_recursive.on_value_change(lambda _e: render_plan())
             render_plan()
@@ -329,23 +379,41 @@ def show_decrypt_dialog(
                 w_ack.visible = False
 
         with progress_box:
+            phase_label = ui.label("Preparing…").classes("text-caption text-grey-8")
             progress_label = ui.label("Decrypting…").classes("text-body2")
-            ui.spinner(size="lg").classes("mx-auto my-2")
-            ui.label("Leave this window open until cipher finishes.").classes(
-                "text-caption text-grey-7"
+            progress_bar = ui.linear_progress(value=0, show_value=False).classes(
+                "w-full"
             )
+            progress_counts = ui.label("").classes("text-caption text-grey-8")
+            progress_hint = ui.label(
+                "Pause waits for the current batch. Stop ends cipher now."
+            ).classes("text-caption text-grey-7")
 
         with result_box:
             result_title = ui.label("").classes("text-subtitle2")
             result_body = ui.code("").classes("w-full")
 
-        with ui.row().classes("w-full justify-end gap-2"):
+        with ui.row().classes("w-full justify-end gap-2 flex-wrap"):
             cancel_btn = ui.button("Cancel", on_click=dialog.close).props("flat")
             decrypt_btn = ui.button(
                 "Decrypt selected",
                 icon="lock_open",
             ).props("unelevated color=negative")
+            pause_btn = ui.button("Pause", icon="pause", on_click=lambda: None).props(
+                "outline"
+            )
+            resume_btn = ui.button(
+                "Resume",
+                icon="play_arrow",
+                on_click=lambda: None,
+            ).props("unelevated")
+            stop_run_btn = ui.button("Stop", icon="stop", on_click=lambda: None).props(
+                "outline color=negative"
+            )
             close_btn = ui.button("Close", on_click=dialog.close).props("flat")
+            pause_btn.visible = False
+            resume_btn.visible = False
+            stop_run_btn.visible = False
             close_btn.visible = False
 
         def refresh_decrypt_btn() -> None:
@@ -373,9 +441,37 @@ def show_decrypt_dialog(
             decrypt_btn.visible = False
             confirm_box.visible = False
             progress_box.visible = True
+            pause_btn.visible = True
+            resume_btn.visible = False
+            stop_run_btn.visible = True
             progress_label.set_text("Starting cipher /D…")
+            progress_bar.props("indeterminate")
+            progress_bar.set_value(0)
 
             prog = cipher_ops.DecryptProgress()
+            started_at = time.monotonic()
+            tick_state = {"phase": "", "indeterminate": False}
+
+            def do_pause() -> None:
+                prog.request_pause()
+                pause_btn.visible = False
+                resume_btn.visible = True
+
+            def do_resume() -> None:
+                prog.request_resume()
+                resume_btn.visible = False
+                pause_btn.visible = True
+
+            def do_stop() -> None:
+                prog.request_stop()
+                pause_btn.disable()
+                resume_btn.disable()
+                stop_run_btn.disable()
+                progress_hint.set_text("Stopping after the current cipher process…")
+
+            pause_btn.on_click(do_pause)
+            resume_btn.on_click(do_resume)
+            stop_run_btn.on_click(do_stop)
 
             def tick() -> None:
                 if progress_label.is_deleted:
@@ -385,14 +481,72 @@ def show_decrypt_dialog(
                     total = prog.total
                     current = prog.current
                     message = prog.message
-                if total:
-                    loc = current if len(current) < 80 else "…" + current[-77:]
-                    progress_label.set_text(
-                        f"Decrypting {done} / {total}"
-                        + (f" — {loc}" if loc else "")
+                    phase = prog.phase
+                    paused = prog.paused
+                    ok_n = prog.ok
+                    failed_n = prog.failed
+                    tail = prog.output_tail
+                    hit_cap = prog.hit_cap
+                elapsed = int(time.monotonic() - started_at)
+                mins, secs = divmod(elapsed, 60)
+                clock = f"{mins}:{secs:02d}"
+                loc = current if len(current) < 80 else "…" + current[-77:]
+                if phase == "prepare":
+                    phase_label.set_text(
+                        f"Step 1 of 3 — Prepare · {clock}"
+                        if large_job
+                        else f"Preparing · {clock}"
                     )
-                elif message:
-                    progress_label.set_text(message)
+                    if not tick_state["indeterminate"]:
+                        progress_bar.props("indeterminate")
+                        tick_state["indeterminate"] = True
+                    progress_label.set_text(message or "Listing encrypted items…")
+                    progress_counts.set_text(loc)
+                    return
+                if tick_state["indeterminate"] and phase != "prepare":
+                    progress_bar.props(remove="indeterminate")
+                    tick_state["indeterminate"] = False
+                if phase == "decrypt":
+                    if paused:
+                        step = "Paused"
+                    elif large_job:
+                        step = "Step 2 of 3 — Decrypt"
+                    else:
+                        step = "Decrypting"
+                    phase_label.set_text(f"{step} · {clock}")
+                    fraction = (done / total) if total else 0.0
+                    progress_bar.set_value(min(1.0, max(0.0, fraction)))
+                    pct = int(round(100 * fraction)) if total else 0
+                    if paused:
+                        progress_label.set_text(
+                            f"Paused at {done:,} / {total:,}. "
+                            "Remaining files stay encrypted until you resume."
+                        )
+                    else:
+                        progress_label.set_text(
+                            f"Decrypting {done:,} / {total:,} ({pct}%)"
+                            + (f" — {loc}" if loc else "")
+                        )
+                    extra = f"{ok_n:,} decrypted"
+                    if failed_n:
+                        extra += f" · {failed_n:,} still encrypted"
+                    if hit_cap:
+                        extra += " · listing hit the item cap"
+                    if tail and not paused:
+                        extra += f" · {tail}"
+                    progress_counts.set_text(extra)
+                    return
+                phase_label.set_text(
+                    f"Step 3 of 3 — Done · {clock}" if large_job else f"Done · {clock}"
+                )
+                if tick_state["indeterminate"]:
+                    progress_bar.props(remove="indeterminate")
+                    tick_state["indeterminate"] = False
+                progress_bar.set_value(
+                    1 if total and done >= total else (done / total if total else 1)
+                )
+                progress_label.set_text(message or "Finishing…")
+                progress_counts.set_text("")
 
             timer = ui.timer(0.35, tick)
 
@@ -403,13 +557,19 @@ def show_decrypt_dialog(
                     progress=prog,
                 )
 
+            def show_result_chrome() -> None:
+                pause_btn.visible = False
+                resume_btn.visible = False
+                stop_run_btn.visible = False
+                progress_box.visible = False
+                result_box.visible = True
+                close_btn.visible = True
+
             try:
                 results = await run.io_bound(worker)
             except Exception as exc:
                 timer.deactivate()
-                progress_box.visible = False
-                result_box.visible = True
-                close_btn.visible = True
+                show_result_chrome()
                 result_title.set_text("Decrypt failed to start")
                 result_body.set_content(str(exc))
                 ui.notify(str(exc), type="negative")
@@ -418,46 +578,60 @@ def show_decrypt_dialog(
             timer.deactivate()
             on_done(results)
 
-            ok = sum(1 for item in results if item.ok)
+            decrypted_n = sum(item.decrypted for item in results)
+            leftover_n = sum(item.leftover for item in results)
             failed = [item for item in results if not item.ok]
-            leftover = sum(1 for item in results if item.still_encrypted)
-            progress_box.visible = False
-            result_box.visible = True
-            close_btn.visible = True
+            stopped = prog.cancelled or any(item.cancelled for item in results)
+            show_result_chrome()
 
-            if not results:
-                result_title.set_text("Nothing was decrypted.")
+            if stopped and not results:
+                title = "Stopped before anything was decrypted."
+                result_body.set_content(
+                    "Listing was cancelled. Files are still encrypted."
+                )
+            elif not results:
+                title = "Nothing was decrypted."
                 result_body.set_content("No matching paths were left to pass to cipher.")
-            elif not failed:
-                result_title.set_text(
-                    f"Decrypted {ok:,} target(s). They are now plaintext on disk."
+            elif stopped:
+                title = (
+                    f"Stopped. Decrypted {decrypted_n:,} item(s). "
+                    f"{leftover_n:,} still encrypted."
+                )
+            elif leftover_n == 0 and not failed:
+                title = (
+                    f"Decrypted {decrypted_n:,} item(s). They are now plaintext on disk."
                 )
             else:
-                result_title.set_text(
-                    f"Decrypted {ok:,} of {len(results):,} target(s). "
-                    f"{len(failed):,} failed"
-                    + (f", {leftover:,} still encrypted" if leftover else "")
+                title = (
+                    f"Decrypted {decrypted_n:,} item(s). "
+                    f"{leftover_n:,} still encrypted"
+                    + (f", {len(failed):,} command(s) reported an error" if failed else "")
                     + "."
                 )
+            if prog.hit_cap:
+                title += (
+                    f" Listing stopped at {cipher_ops.DECRYPT_EXPAND_CAP:,} items — "
+                    "run again for the rest."
+                )
+            result_title.set_text(title)
+            if results:
+                result_body.set_content(_format_decrypt_log(results))
 
-            chunks: list[str] = []
-            for item in results:
-                mark = "OK" if item.ok else "FAILED"
-                block = f"[{mark}] {item.command}"
-                if item.text:
-                    block += "\n" + item.text
-                if item.still_encrypted:
-                    block += "\n(Still has the Encrypted NTFS attribute.)"
-                chunks.append(block)
-            result_body.set_content("\n\n".join(chunks) or "(no cipher output)")
-
-            if failed:
+            if stopped:
+                if decrypted_n:
+                    ui.notify(
+                        f"Stopped after {decrypted_n:,} decrypted.",
+                        type="warning",
+                    )
+                else:
+                    ui.notify("Decrypt stopped. Nothing was changed.", type="warning")
+            elif leftover_n or failed:
                 ui.notify(
-                    f"Decrypted {ok:,}; {len(failed):,} failed.",
+                    f"Decrypted {decrypted_n:,}; {leftover_n:,} still encrypted.",
                     type="warning",
                 )
-            elif ok:
-                ui.notify(f"Decrypted {ok:,} item(s).", type="positive")
+            elif decrypted_n:
+                ui.notify(f"Decrypted {decrypted_n:,} item(s).", type="positive")
 
         decrypt_btn.on_click(start_decrypt)
 
@@ -1219,13 +1393,16 @@ def build_scanner_tab() -> None:
 
             def after(results: list[cipher_ops.DecryptResult]) -> None:
                 drop_unencrypted_rows()
-                ok = sum(1 for item in results if item.ok)
-                failed = sum(1 for item in results if not item.ok)
-                if ok and not failed:
-                    status.set_text(f"Decrypted {ok:,} selected target(s) with cipher /D.")
-                elif ok or failed:
+                decrypted_n = sum(item.decrypted for item in results)
+                leftover_n = sum(item.leftover for item in results)
+                if decrypted_n and not leftover_n:
                     status.set_text(
-                        f"cipher /D finished: {ok:,} decrypted, {failed:,} failed."
+                        f"Decrypted {decrypted_n:,} item(s) with cipher /D."
+                    )
+                elif decrypted_n or leftover_n:
+                    status.set_text(
+                        f"cipher /D finished: {decrypted_n:,} decrypted, "
+                        f"{leftover_n:,} still encrypted."
                     )
 
             show_decrypt_dialog(rows, on_done=after)

@@ -43,6 +43,9 @@ BitLocker. BitLocker encrypts a whole drive; EFS encrypts **individual files
 and folders** so that only the user (and any recovery agent) can open them.
 
 - Works **only on NTFS**. FAT32, exFAT, and most network shares cannot hold EFS.
+  This app refuses those volumes (`Not NTFS (FAT32)`). There is no in-place
+  folder encryption on FAT32; BitLocker To Go can still encrypt a whole
+  removable drive.
 - In Explorer, an EFS item shows a **padlock** overlay on its icon.
 - `cipher` with **no switches** lists the current folder: **`E`** = encrypted,
   **`U`** = unencrypted.
@@ -247,8 +250,10 @@ COMMANDS: list[CipherCommand] = [
             "Always encrypt the parent folder as well as the files. Combine with "
             "`/S:` to walk a tree. Hidden/system files are skipped unless you add `/H`. "
             "`/B` stops at the first error instead of continuing. Cannot encrypt "
-            "read-only files. Wired to the **Encrypt** tab: add folders, review "
-            "the `cipher /E` commands, confirm the certificate warning, then run."
+            "read-only files. Cannot encrypt FAT32, exFAT, or other non-NTFS "
+            "volumes — EFS is an NTFS feature. Wired to the **Encrypt** tab: "
+            "add folders, review the `cipher /E` commands, confirm the "
+            "certificate warning, then run."
         ),
         "examples": [
             r"cipher /e Private",

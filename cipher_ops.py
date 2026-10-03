@@ -14,6 +14,7 @@ import string
 import subprocess
 import sys
 import threading
+import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -326,12 +327,21 @@ def open_folder(path: str) -> None:
     os.startfile(str(folder))  # type: ignore[attr-defined]
 
 
+# Pack many files into one cipher.exe so a “select all” of thousands of
+# rows does not spawn thousands of processes. 40 paths stays well under
+# CreateProcess’s ~32k command-line cap for typical Windows paths.
+DECRYPT_BATCH_FILES = 40
+DECRYPT_BATCH_CHARS = 24_000
+DECRYPT_EXPAND_CAP = 100_000
+
+
 @dataclass(slots=True)
 class CipherRun:
     args: list[str]
     returncode: int
     text: str
     timed_out: bool = False
+    cancelled: bool = False
 
     @property
     def command(self) -> str:
@@ -344,10 +354,15 @@ class DecryptPlanItem:
     kind: str
     recursive: bool
     args: list[str]
+    members: tuple[str, ...] = ()
 
     @property
     def command(self) -> str:
         return "cipher " + " ".join(self.args)
+
+    @property
+    def member_paths(self) -> tuple[str, ...]:
+        return self.members if self.members else (self.path,)
 
 
 @dataclass(slots=True)
@@ -361,6 +376,10 @@ class DecryptResult:
     text: str
     timed_out: bool = False
     missing: bool = False
+    cancelled: bool = False
+    decrypted: int = 0
+    leftover: int = 0
+    member_count: int = 1
 
 
 @dataclass
@@ -368,8 +387,41 @@ class DecryptProgress:
     current: str = ""
     done: int = 0
     total: int = 0
+    ok: int = 0
+    failed: int = 0
     message: str = ""
+    phase: str = "prepare"
+    paused: bool = False
+    cancelled: bool = False
+    output_tail: str = ""
+    hit_cap: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    resume_event: threading.Event = field(default_factory=threading.Event)
+
+    def __post_init__(self) -> None:
+        if not self.resume_event.is_set():
+            self.resume_event.set()
+
+    def request_pause(self) -> None:
+        with self.lock:
+            self.paused = True
+            self.message = "Pausing after the current cipher batch…"
+        self.resume_event.clear()
+
+    def request_resume(self) -> None:
+        with self.lock:
+            self.paused = False
+            self.message = "Resuming…"
+        self.resume_event.set()
+
+    def request_stop(self) -> None:
+        self.cancel_event.set()
+        with self.lock:
+            self.cancelled = True
+            self.paused = False
+            self.message = "Stopping…"
+        self.resume_event.set()
 
 
 def is_drive_root(path: str) -> bool:
@@ -383,6 +435,26 @@ def _is_under(path: str, root: str) -> bool:
         return False
     prefix = root_n + os.sep
     return path_n.startswith(prefix)
+
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def run_cipher_ex(args: list[str], *, timeout: Optional[float] = 45) -> CipherRun:
@@ -412,6 +484,97 @@ def run_cipher_ex(args: list[str], *, timeout: Optional[float] = 45) -> CipherRu
     )
 
 
+def run_cipher_cancellable(
+    args: list[str],
+    *,
+    timeout: Optional[float] = None,
+    cancel_event: Optional[threading.Event] = None,
+    on_output: Optional[Callable[[str], None]] = None,
+) -> CipherRun:
+    """
+    Run cipher.exe in a killable process.
+
+    Used for long decrypt batches so Stop can end the current cipher.exe
+    instead of waiting for it to drain.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        return CipherRun(
+            args=list(args),
+            returncode=130,
+            text="Stopped before cipher finished.",
+            cancelled=True,
+        )
+    if cancel_event is None and on_output is None and timeout is not None:
+        return run_cipher_ex(args, timeout=timeout)
+    try:
+        proc = subprocess.Popen(
+            ["cipher", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags_no_window(),
+        )
+    except FileNotFoundError:
+        return CipherRun(args=list(args), returncode=127, text="cipher.exe was not found.")
+
+    chunks: list[bytes] = []
+    done = threading.Event()
+
+    def reader() -> None:
+        try:
+            assert proc.stdout is not None
+            while True:
+                piece = proc.stdout.read(4096)
+                if not piece:
+                    break
+                chunks.append(piece)
+                if on_output is not None:
+                    try:
+                        on_output(piece.decode("oem", errors="replace"))
+                    except Exception:
+                        pass
+        finally:
+            done.set()
+
+    threading.Thread(target=reader, daemon=True).start()
+    started = time.monotonic()
+    cancelled = False
+    timed_out = False
+    while not done.wait(0.2):
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            _stop_process(proc)
+            done.wait(3)
+            break
+        if timeout is not None and (time.monotonic() - started) > timeout:
+            timed_out = True
+            _stop_process(proc)
+            done.wait(3)
+            break
+    if proc.poll() is None:
+        _stop_process(proc)
+    text = b"".join(chunks).decode("oem", errors="replace").strip()
+    rc = proc.poll()
+    if rc is None:
+        rc = 130 if cancelled else 124 if timed_out else 1
+    if cancelled:
+        extra = "Stopped before cipher finished."
+        text = f"{text}\n{extra}".strip() if text else extra
+        if rc == 0:
+            rc = 130
+    elif timed_out:
+        extra = f"cipher timed out after {timeout} seconds."
+        text = f"{text}\n{extra}".strip() if text else extra
+        if rc == 0:
+            rc = 124
+    return CipherRun(
+        args=list(args),
+        returncode=int(rc),
+        text=text,
+        timed_out=timed_out,
+        cancelled=cancelled,
+    )
+
+
 def run_cipher(args: list[str], *, timeout: Optional[float] = 45) -> str:
     """Run cipher.exe and return combined text (OEM console encoding)."""
     return run_cipher_ex(args, timeout=timeout).text
@@ -428,6 +591,8 @@ def plan_decrypt(
 
     When recursive_folders is on, a selected folder is decrypted with /S
     and items inside that folder are skipped so cipher is not run twice.
+    At run time recursive folders are listed and decrypted in batches so
+    the progress bar can move.
     """
     unique: list[str] = []
     seen: set[str] = set()
@@ -461,17 +626,186 @@ def plan_decrypt(
                 kind="Folder" if is_dir else "File",
                 recursive=recursive,
                 args=args,
+                members=(path,),
             )
         )
     return plan
+
+
+def pack_decrypt_plan(
+    plan: Iterable[DecryptPlanItem],
+    *,
+    batch_files: int = DECRYPT_BATCH_FILES,
+    batch_chars: int = DECRYPT_BATCH_CHARS,
+) -> list[DecryptPlanItem]:
+    """Merge consecutive non-recursive items into fewer cipher invocations."""
+    packed: list[DecryptPlanItem] = []
+    batch: list[DecryptPlanItem] = []
+
+    def cmd_len(items: list[DecryptPlanItem]) -> int:
+        size = len("cipher /d /h")
+        for item in items:
+            size += 3 + len(item.path)
+        return size
+
+    def flush() -> None:
+        nonlocal batch
+        if not batch:
+            return
+        if len(batch) == 1:
+            packed.append(batch[0])
+            batch = []
+            return
+        hidden = any(
+            any(str(arg).lower() == "/h" for arg in item.args) for item in batch
+        )
+        paths = tuple(item.path for item in batch)
+        args = ["/d"]
+        if hidden:
+            args.append("/h")
+        args.extend(paths)
+        kind = "File" if all(item.kind == "File" for item in batch) else "Item"
+        packed.append(
+            DecryptPlanItem(
+                path=paths[0],
+                kind=kind,
+                recursive=False,
+                args=args,
+                members=paths,
+            )
+        )
+        batch = []
+
+    for item in plan:
+        if item.recursive:
+            flush()
+            packed.append(item)
+            continue
+        if batch and (
+            len(batch) >= batch_files or cmd_len(batch + [item]) > batch_chars
+        ):
+            flush()
+        batch.append(item)
+    flush()
+    return packed
+
+
+def _decrypt_plan_item(
+    path: str,
+    *,
+    kind: str,
+    include_hidden: bool,
+) -> DecryptPlanItem:
+    args = ["/d"]
+    if include_hidden:
+        args.append("/h")
+    args.append(path)
+    return DecryptPlanItem(
+        path=path,
+        kind=kind,
+        recursive=False,
+        args=args,
+        members=(path,),
+    )
+
+
+def expand_recursive_decrypt_item(
+    item: DecryptPlanItem,
+    *,
+    include_hidden: bool = True,
+    progress: Optional[DecryptProgress] = None,
+    max_results: int = DECRYPT_EXPAND_CAP,
+) -> list[DecryptPlanItem]:
+    """
+    Replace a cipher /D /S folder with the encrypted files and folders inside
+    it, so decrypt progress can count real items instead of one opaque command.
+    """
+    if not item.recursive:
+        return [item]
+
+    scan_prog = ScanProgress(running=True)
+
+    def on_scan_progress(sp: ScanProgress) -> None:
+        if progress is None:
+            return
+        if progress.cancel_event.is_set():
+            sp.cancel_event.set()
+        with sp.lock:
+            scanned = sp.scanned
+            found_n = sp.found
+            current = sp.current
+        with progress.lock:
+            progress.phase = "prepare"
+            progress.message = (
+                f"Listing encrypted items — scanned {scanned:,}, found {found_n:,}"
+            )
+            progress.current = current
+
+    found = scan_encrypted(
+        [item.path],
+        recursive=True,
+        include_hidden=include_hidden,
+        skip_system=False,
+        progress=scan_prog,
+        on_progress=on_scan_progress,
+        max_results=max_results,
+    )
+    if progress is not None and progress.cancel_event.is_set():
+        return []
+
+    hit_cap = "Stopped at" in (scan_prog.message or "")
+    if progress is not None and hit_cap:
+        with progress.lock:
+            progress.hit_cap = True
+
+    files = [entry for entry in found if entry.kind == "File"]
+    folders = [entry for entry in found if entry.kind == "Folder"]
+    folders.sort(key=lambda entry: str(entry.path).count(os.sep), reverse=True)
+
+    expanded: list[DecryptPlanItem] = []
+    seen: set[str] = set()
+    for entry in files + folders:
+        key = os.path.normcase(entry.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        expanded.append(
+            _decrypt_plan_item(
+                entry.path,
+                kind=entry.kind,
+                include_hidden=include_hidden,
+            )
+        )
+
+    root = os.path.abspath(item.path)
+    if os.path.isdir(root) and os.path.normcase(root) not in seen:
+        expanded.append(
+            _decrypt_plan_item(root, kind="Folder", include_hidden=include_hidden)
+        )
+    return expanded
+
+
+def _wait_while_paused(prog: DecryptProgress) -> None:
+    while True:
+        if prog.cancel_event.is_set():
+            return
+        with prog.lock:
+            paused = prog.paused
+        if not paused:
+            return
+        prog.resume_event.wait(0.25)
 
 
 def decrypt_path(
     item: DecryptPlanItem,
     *,
     timeout: Optional[float] = None,
+    cancel_event: Optional[threading.Event] = None,
+    on_output: Optional[Callable[[str], None]] = None,
 ) -> DecryptResult:
-    if not os.path.exists(item.path):
+    members = item.member_paths
+    existing = [path for path in members if os.path.exists(path)]
+    if not existing:
         return DecryptResult(
             path=item.path,
             kind=item.kind,
@@ -479,25 +813,61 @@ def decrypt_path(
             ok=False,
             still_encrypted=False,
             command=item.command,
-            text="Path no longer exists.",
+            text="Path no longer exists."
+            if len(members) == 1
+            else "Those paths no longer exist.",
             missing=True,
+            member_count=len(members),
         )
+
+    hidden = any(str(arg).lower() == "/h" for arg in item.args)
+    if item.recursive and len(existing) == 1:
+        args = list(item.args)
+    else:
+        args = ["/d"]
+        if hidden:
+            args.append("/h")
+        args.extend(existing)
+
     if timeout is None:
-        timeout = None if item.recursive else 180
-    run = run_cipher_ex(item.args, timeout=timeout)
-    still = is_encrypted_path(item.path)
+        timeout = None if (cancel_event is not None or item.recursive) else 180
+
+    if cancel_event is not None or on_output is not None:
+        run = run_cipher_cancellable(
+            args,
+            timeout=timeout,
+            cancel_event=cancel_event,
+            on_output=on_output,
+        )
+    else:
+        run = run_cipher_ex(args, timeout=timeout)
+
+    leftover_paths = [path for path in existing if is_encrypted_path(path)]
+    leftover = len(leftover_paths)
+    decrypted = len(existing) - leftover
+    missing = len(existing) != len(members)
     note = run.text
     if run.timed_out and not note:
         note = "cipher timed out."
+    if missing:
+        skipped = len(members) - len(existing)
+        extra = f"{skipped} path(s) no longer exist."
+        note = f"{note}\n{extra}".strip() if note else extra
+    command = "cipher " + " ".join(args)
     return DecryptResult(
         path=item.path,
         kind=item.kind,
         recursive=item.recursive,
-        ok=not still and not run.timed_out,
-        still_encrypted=still,
-        command=item.command,
+        ok=leftover == 0 and not run.timed_out and not run.cancelled and not missing,
+        still_encrypted=leftover > 0,
+        command=command,
         text=note,
         timed_out=run.timed_out,
+        missing=missing,
+        cancelled=run.cancelled,
+        decrypted=decrypted,
+        leftover=leftover,
+        member_count=len(members),
     )
 
 
@@ -516,27 +886,110 @@ def decrypt_paths(
     )
     results: list[DecryptResult] = []
     prog = progress
+
+    def cancelled() -> bool:
+        return prog is not None and prog.cancel_event.is_set()
+
     if prog is not None:
         with prog.lock:
-            prog.total = len(plan)
+            prog.phase = "prepare"
             prog.done = 0
-            prog.message = "Starting…"
+            prog.total = 0
+            prog.ok = 0
+            prog.failed = 0
+            prog.message = "Preparing decrypt…"
+
+    expanded: list[DecryptPlanItem] = []
     for item in plan:
+        if cancelled():
+            break
+        if item.recursive:
+            if prog is not None:
+                with prog.lock:
+                    prog.phase = "prepare"
+                    prog.message = f"Listing encrypted items in {item.path}…"
+                    prog.current = item.path
+            piece = expand_recursive_decrypt_item(
+                item,
+                include_hidden=include_hidden,
+                progress=prog,
+            )
+            if cancelled():
+                break
+            expanded.extend(piece)
+        else:
+            expanded.append(item)
+
+    if cancelled() and not results:
         if prog is not None:
             with prog.lock:
+                prog.cancelled = True
+                prog.phase = "done"
+                prog.message = "Stopped while listing. Nothing was decrypted."
+                prog.current = ""
+        return []
+
+    packed = pack_decrypt_plan(expanded)
+    total = sum(len(item.member_paths) for item in packed)
+    if prog is not None:
+        with prog.lock:
+            prog.phase = "decrypt"
+            prog.total = total
+            prog.done = 0
+            prog.message = "Starting…"
+
+    for item in packed:
+        if cancelled():
+            break
+        if prog is not None:
+            _wait_while_paused(prog)
+            if cancelled():
+                break
+            n = len(item.member_paths)
+            with prog.lock:
                 prog.current = item.path
-                prog.message = item.command
-        result = decrypt_path(item)
+                prog.message = item.command if n == 1 else f"{n} items — {item.path}"
+
+        def on_out(text: str, _prog: Optional[DecryptProgress] = prog) -> None:
+            if _prog is None:
+                return
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            tail = lines[-1] if lines else ""
+            if not tail:
+                return
+            with _prog.lock:
+                _prog.output_tail = tail[-200:]
+
+        result = decrypt_path(
+            item,
+            cancel_event=prog.cancel_event if prog is not None else None,
+            on_output=on_out if prog is not None else None,
+        )
         results.append(result)
         if prog is not None:
             with prog.lock:
-                prog.done += 1
+                prog.done += len(item.member_paths)
+                prog.ok += result.decrypted
+                prog.failed += result.leftover
                 prog.current = item.path
+
     if prog is not None:
-        ok = sum(1 for item in results if item.ok)
+        decrypted_n = sum(item.decrypted for item in results)
+        leftover_n = sum(item.leftover for item in results)
         with prog.lock:
-            prog.message = f"Done. {ok} of {len(results)} target(s) decrypted."
+            prog.phase = "done"
             prog.current = ""
+            if prog.cancel_event.is_set():
+                prog.cancelled = True
+                prog.message = (
+                    f"Stopped. {decrypted_n:,} decrypted, {leftover_n:,} still encrypted."
+                )
+            elif leftover_n:
+                prog.message = (
+                    f"Done. {decrypted_n:,} decrypted, {leftover_n:,} still encrypted."
+                )
+            else:
+                prog.message = f"Done. {decrypted_n:,} decrypted."
     return results
 
 
@@ -924,6 +1377,7 @@ def scan_encrypted(
     skip_system: bool = True,
     progress: Optional[ScanProgress] = None,
     on_item: Optional[Callable[[EncryptedItem], None]] = None,
+    on_progress: Optional[Callable[[ScanProgress], None]] = None,
     max_results: int = 20_000,
 ) -> list[EncryptedItem]:
     """
@@ -941,6 +1395,11 @@ def scan_encrypted(
             prog.found = len(found)
             if current:
                 prog.message = current
+        if on_progress is not None:
+            try:
+                on_progress(prog)
+            except Exception:
+                pass
 
     roots_list = [os.path.abspath(r) for r in roots if r]
     for root in roots_list:

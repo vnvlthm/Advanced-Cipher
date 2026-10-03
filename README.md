@@ -13,8 +13,8 @@ shows). Details still come from `cipher /c` and `cipher /y`.
 
 | Tab | What it does |
 |---|---|
-| **Find encrypted** | Scan a folder or every local NTFS drive. List encrypted files and folders. Switch to **Folders with files** to list every parent folder that contains encrypted files (even if the folder itself is not marked encrypted), then decrypt that folder with `cipher /D /S`. Reveal in Explorer, copy the path, show `cipher /c`, or decrypt a selection. Sort **Folders first**. |
-| **Encrypt** | Add folders, preview `cipher /E` (`/S` tree, `/H` hidden, `/B` stop on error), confirm, and encrypt as the current Windows user. |
+| **Find encrypted** | Scan a folder or every local NTFS drive. List encrypted files and folders. Switch to **Folders with files** to list every parent folder that contains encrypted files (even if the folder itself is not marked encrypted), then decrypt that folder with `cipher /D /S`. Reveal in Explorer, copy the path, show `cipher /c`, or decrypt a selection. Large decrypt jobs run in batches with a progress bar, **Pause**, and **Stop**. Sort **Folders first**. |
+| **Encrypt** | Add folders, preview `cipher /E` (`/S` tree, `/H` hidden, `/B` stop on error), confirm, and encrypt as the current Windows user. Non-NTFS paths (FAT32, exFAT, …) are refused. |
 | **Cipher manual** | What EFS is, quick start, safety, how it differs from BitLocker. |
 | **Command map** | Every `cipher` switch with syntax, examples, and whether this app wraps it. |
 
@@ -22,9 +22,23 @@ shows). Details still come from `cipher /c` and `cipher /y`.
 
 ## Requirements
 
-- Windows, NTFS volumes (EFS does not exist on FAT / exFAT)
+- Windows, **NTFS** volumes
 - Python 3.10+
 - NiceGUI
+
+## FAT32 / exFAT
+
+EFS (and this app) can encrypt files and folders **only on NTFS**. FAT32 and
+exFAT have no encrypted-folder attribute, so `cipher /E` and Explorer’s
+“Encrypt contents to secure data” cannot mark a folder on those volumes.
+
+The Encrypt tab reports `Not NTFS (FAT32)` and skips the path. Copying an
+already-encrypted file onto FAT32 decrypts it in transit (the copy is
+plaintext).
+
+Other Windows options still exist: **BitLocker To Go** encrypts a whole
+removable drive, including FAT32 USB sticks. Encrypted archives or containers
+can also sit on FAT32. None of those is per-folder EFS.
 
 ## Install
 
@@ -51,7 +65,7 @@ saved locally to `user_config.json`, which is gitignored.
 4. Click **Find encrypted items**.
 5. Double-click a row, or use **Reveal in Explorer**, to open that position in Explorer.
 6. **cipher /c details** shows who can decrypt the file.
-7. Check rows and click **Decrypt** to run `cipher /D` after a confirmation. Folders default to `/D /S`.
+7. Check rows and click **Decrypt** to run `cipher /D` after a confirmation. Folders default to `/D /S`. Large jobs list the tree first, then decrypt in batches so you can **Pause** or **Stop**.
 8. Use **Folders with files** to list unique parent folders of those files, then decrypt a folder in one step.
 9. Use **Folders first** (or the Type column) to group folders above files.
 
@@ -63,8 +77,9 @@ saved locally to `user_config.json`, which is gitignored.
 4. Review the `cipher /E` command preview.
 5. Click **Encrypt folders**, tick the certificate warning, and confirm.
 
-The folder is marked so new files dropped in it stay encrypted. Do not “Run as
-administrator” unless you want that admin account to own the encryption.
+The folder is marked so new files dropped in it stay encrypted. The volume
+must be NTFS. Do not “Run as administrator” unless you want that admin
+account to own the encryption.
 
 ## Safety
 
