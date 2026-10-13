@@ -20,6 +20,12 @@ shows). Details still come from `cipher /c` and `cipher /y`.
 
 `cipher /W` (wipe unused disk space) is documented and **not wired**.
 
+## Screenshot
+
+![Find encrypted tab](docs/screenshots/main.png)
+
+Pick a folder, scan for EFS items, then reveal, inspect, or decrypt a selection.
+
 ## Requirements
 
 - Windows, **NTFS** volumes
@@ -98,6 +104,7 @@ cipher_ops.py             # NTFS scan, Explorer, cipher.exe wrappers
 cipher_docs.py            # Manual text + command catalog
 requirements.txt
 user_config.example.json  # shape of the local settings file
+docs/screenshots/         # UI capture for this README
 ```
 
 ## License
